@@ -10,7 +10,7 @@
 - `references/` 中的六个 Markdown 文件
 - `assets/figure_style.py`
 
-无需复制课程截图、`stage1-materials/`、`tests/` 或此 README；不需要 `agents/`、`scripts/` 或安装器。已有部署先对比并保留本地修改，不直接覆盖。当前源码仓库本身不是其他项目的自动部署位置。
+无需 README；不需要 `agents/`、`scripts/` 或安装器。已有部署先对比并保留本地修改，不直接覆盖。当前源码仓库本身不是其他项目的自动部署位置。
 
 Codex 可按 description 匹配，也可显式调用 `$pyfigure-inhance-skill`。项目本地路径及元数据要求见 [OpenAI 官方部署说明](https://learn.chatgpt.com/docs/build-skills)。这里仅支持 Codex，不承诺其他客户端兼容。
 
