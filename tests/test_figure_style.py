@@ -1,5 +1,6 @@
 """Runtime tests in isolated projects; no competition data is accessed."""
 from pathlib import Path
+import json
 import shutil
 import subprocess
 import sys
@@ -57,18 +58,23 @@ class FigureStyleTests(unittest.TestCase):
 
     def test_unavailable_font_fails(self):
         with patch.object(style.font_manager, "findfont", side_effect=ValueError("missing")):
-            with self.assertRaisesRegex(RuntimeError, "No available font"):
+            with self.assertRaisesRegex(RuntimeError, "Required font unavailable"):
                 with style.paper_style(required_text="结果"):
                     pass
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_explicit_font_must_cover_labels(self):
-        with self.assertRaises(RuntimeError):
-            with style.paper_style(required_text="结果", font_family="DejaVu Sans"):
+    def test_fixed_fonts_cannot_be_replaced(self):
+        for key, value in (("font.family", "DejaVu Sans"), ("mathtext.fontset", "stix"),
+                           ("text.usetex", True), ("pdf.use14corefonts", True)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                with style.paper_style(overrides={key: value}):
+                    pass
+        with self.assertRaisesRegex(RuntimeError, "do not cover"):
+            with style.paper_style(required_text="\U0010ffff"):
                 pass
 
     def test_unicode_minus_uses_selected_font_support(self):
-        with patch.object(style, "_font", return_value=("DejaVu Sans", False)):
+        with patch.object(style, "_fonts", return_value=False):
             with style.paper_style():
                 self.assertFalse(mpl.rcParams["axes.unicode_minus"])
 
@@ -98,9 +104,9 @@ class FigureStyleTests(unittest.TestCase):
         self.assertEqual([p.suffix for p in result.paths], [".svg", ".pdf"])
 
     def test_export_detects_labels_omitted_from_font_preflight(self):
-        with style.paper_style(font_family="DejaVu Sans"):
+        with style.paper_style():
             fig, ax = self.figure()
-            ax.set_xlabel("中文结果")
+            ax.set_xlabel("Unsupported \U0010ffff")
             with self.assertRaisesRegex(RuntimeError, "Missing glyphs"):
                 style.save_figure(fig, "figures/bad.pdf", project_root=self.root)
         self.assertFalse((self.root / "figures").exists())
@@ -158,11 +164,11 @@ class FigureStyleTests(unittest.TestCase):
         with style.paper_style():
             fig, ax = self.figure()
             original_data = ax.lines[0].get_xydata().copy()
-            title = fig.text(0.95, 0.96, "A deliberately long title outside the canvas")
+            note = fig.text(0.95, 0.20, "Source: saved simulation results")
             first = style.save_figure(fig, "before.pdf", project_root=self.root)
             self.assertTrue(any("outside" in message for message in first.warnings))
-            title.set_position((0.5, 0.96))
-            title.set_ha("center")
+            note.set_position((0.6, 0.20))
+            note.set_ha("center")
             second = style.save_figure(fig, "after.pdf", project_root=self.root)
             self.assertFalse(any("outside" in message for message in second.warnings))
             np.testing.assert_array_equal(original_data, ax.lines[0].get_xydata())
@@ -231,6 +237,128 @@ class FigureStyleTests(unittest.TestCase):
             style.save_figure(fig, "bad.png", project_root=self.root)
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_titles_rejected_without_silent_removal(self):
+        for location in ("left", "center", "right", "suptitle"):
+            with self.subTest(location=location), style.paper_style():
+                fig, ax = self.figure()
+                text = fig.suptitle("Heading") if location == "suptitle" else ax.set_title("Heading", loc=location)
+                with self.assertRaisesRegex(ValueError, "No in-figure titles"):
+                    style.save_figure(fig, "bad.pdf", project_root=self.root)
+                self.assertEqual(text.get_text(), "Heading")
+                plt.close(fig)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_bilingual_svg_uses_exact_glyph_families(self):
+        with style.paper_style(required_text="时间 Time 2026 −1"):
+            fig, ax = self.figure()
+            ax.set_xlabel("时间 Time 2026 −1")
+            self.assertEqual(ax.xaxis.label.get_fontfamily(), list(style.FONT_FAMILIES))
+            result = style.save_figure(fig, "mixed.svg", project_root=self.root, preview=False)
+        svg = result.paths[0].read_text(encoding="utf-8")
+        for family, char in (("SimSun", "时"), ("Times New Roman", "T")):
+            font = style.FT2Font(style.font_manager.findfont(
+                style.font_manager.FontProperties(family=family, weight="bold"), fallback_to_default=False))
+            # Matplotlib 3.11 identifies paths by glyph index; older versions
+            # used Unicode. Verify the rendered path/use, not just rcParams.
+            ids = (f"{font.postscript_name}-{font.get_char_index(ord(char)):x}",
+                   f"{font.postscript_name}-{ord(char):x}")
+            self.assertTrue(any(f'xlink:href="#{glyph}"' in svg for glyph in ids),
+                            f"Expected {family} glyph for {char}")
+        self.assertNotIn("DejaVu", svg)
+
+    def test_math_missing_glyph_fails_without_dummy_output(self):
+        import logging
+        logger = logging.getLogger("matplotlib")
+        before = list(logger.handlers)
+        with self.assertRaisesRegex(RuntimeError, "Missing mathematical glyph"):
+            with style.paper_style():
+                fig, ax = self.figure()
+                ax.set_xlabel(r"$\oiint$")
+                style.save_figure(fig, "bad.pdf", project_root=self.root)
+        self.assertEqual(logger.handlers, before)
+        self.assertFalse((self.root / "bad.pdf").exists())
+
+    def test_project_palette_persists_and_trials_do_not_write(self):
+        profile = self.root / ".figure-style.json"
+        profile.write_text(json.dumps({"version": 1, "palettes": {"categorical": "nejm",
+            "sequential": "cividis", "diverging": "BrBG"}}), encoding="utf-8")
+        before = profile.read_bytes()
+        with style.paper_style(project_root=self.root):
+            self.assertEqual(mpl.rcParams["axes.prop_cycle"].by_key()["color"], list(style.PALETTES["nejm"]))
+            self.assertEqual(mpl.rcParams["image.cmap"], "cividis")
+        for candidate in style.PALETTES:
+            with style.paper_style(project_root=self.root, palette=candidate):
+                self.assertEqual(mpl.rcParams["axes.prop_cycle"].by_key()["color"], list(style.PALETTES[candidate]))
+        self.assertEqual(style.palette_colors(project_root=self.root), style.PALETTES["nejm"])
+        self.assertEqual(style.palette_cmap("diverging", project_root=self.root).name, "BrBG")
+        self.assertEqual(profile.read_bytes(), before)
+        self.assertEqual(len(list(self.root.iterdir())), 1)
+
+    def test_partial_confirmation_does_not_confirm_other_types(self):
+        profile = self.root / ".figure-style.json"
+        profile.write_text('{"version":1,"palettes":{"categorical":"aaas"}}', encoding="utf-8")
+        before = profile.read_bytes()
+        self.assertEqual(style.palette_cmap("sequential", project_root=self.root).name, "viridis")
+        self.assertEqual(profile.read_bytes(), before)
+
+    def test_missing_profile_uses_provisional_defaults_without_writing(self):
+        self.assertEqual(style.palette_colors(project_root=self.root), style.PALETTES["npg"])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_invalid_profile_or_palette_does_not_reset(self):
+        profile = self.root / ".figure-style.json"
+        for content in ('broken', '[]', '{"version":2,"palettes":{}}',
+                        '{"version":1,"palettes":{"sequential":"nejm"}}',
+                        '{"version":1,"palettes":{"unknown":"viridis"}}'):
+            profile.write_text(content, encoding="utf-8")
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                style.palette_colors(project_root=self.root)
+            self.assertEqual(profile.read_text(encoding="utf-8"), content)
+        for kind, candidate in (("categorical", "viridis"), ("sequential", "npg"), ("diverging", "Blues")):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                style.palette_cmap(kind, candidate)
+        with self.assertRaises(ValueError):
+            style.palette_colors("npg", count=11)
+
+    def test_color_only_variants_preserve_all_noncolor_state(self):
+        with style.paper_style(project_root=self.root):
+            fig, ax = self.figure()
+            style.save_figure(fig, "initial.pdf", project_root=self.root)
+            line = ax.lines[0]
+            def snapshot():
+                return (line.get_xydata().tolist(), line.get_linewidth(), line.get_linestyle(),
+                        line.get_marker(), ax.get_position().bounds, ax.get_xlim(), ax.get_ylim(),
+                        ax.xaxis.label.get_fontsize(), ax.xaxis.label.get_fontweight(),
+                        tuple(fig.get_size_inches()))
+            before = snapshot()
+            for candidate in style.PALETTES:
+                color = style.palette_colors(candidate, count=1)[0]
+                line.set_color(color)
+                ax.get_legend().get_lines()[0].set_color(color)
+                style.save_figure(fig, f"variant-{candidate}.pdf", project_root=self.root, layout="preserve")
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(line.get_color(), color)
+            self.assertFalse((self.root / ".figure-style.json").exists())
+
+    def test_continuous_recolor_preserves_values_norm_and_limits(self):
+        with style.paper_style():
+            fig, ax = plt.subplots()
+            norm = mpl.colors.TwoSlopeNorm(vmin=-3, vcenter=0, vmax=5)
+            mesh = ax.pcolormesh([[-3, 0], [2, 5]], norm=norm,
+                                 cmap=style.palette_cmap("diverging"))
+            colorbar = fig.colorbar(mesh, ax=ax)
+            original = mesh.get_array().copy()
+            for candidate in style.CMAPS["diverging"]:
+                mesh.set_cmap(style.palette_cmap("diverging", candidate))
+                colorbar.solids.set_rasterized(False)
+                colorbar.solids.set_edgecolor("face")
+                result = style.save_figure(fig, candidate + ".svg", project_root=self.root)
+                tree = ET.fromstring(result.paths[0].read_bytes())
+                self.assertEqual(len(tree.findall(".//{http://www.w3.org/2000/svg}image")), 0)
+                self.assertIs(mesh.norm, norm)
+                self.assertEqual(mesh.get_clim(), (-3, 5))
+                np.testing.assert_array_equal(mesh.get_array(), original)
+
     def test_project_copy_runs_without_skill(self):
         code = self.root / "code"
         code.mkdir()
@@ -238,6 +366,8 @@ class FigureStyleTests(unittest.TestCase):
         installed.mkdir(parents=True)
         shutil.copy2(SKILL / "assets" / "figure_style.py", installed / "figure_style.py")
         shutil.copy2(installed / "figure_style.py", code / "_figure_style.py")
+        (self.root / ".figure-style.json").write_text(
+            '{"version":1,"palettes":{"categorical":"lancet"}}', encoding="utf-8")
         installed.parent.rename(installed.parent.with_name("disabled-skill"))
         # This fixture has no sys.path entry for the skill and imports only its
         # project's copy. The command runs from a separate working directory.
@@ -248,7 +378,9 @@ class FigureStyleTests(unittest.TestCase):
             "assert before['font.size'] == m.rcParams['font.size']\n"
             "assert before['backend'] == m.rcParams['backend']\n"
             "import matplotlib.pyplot as p\n"
-            "with paper_style():\n f,a=p.subplots(); a.plot([1,2],[3,4]); "
+            "with paper_style(project_root=Path(__file__).resolve().parents[1]):\n "
+            "assert m.rcParams['axes.prop_cycle'].by_key()['color'][0] == '#00468B'; "
+            "f,a=p.subplots(); a.plot([1,2],[3,4]); "
             "save_figure(f,'figures/copied.pdf',project_root=Path(__file__).resolve().parents[1])\n",
             encoding="utf-8",
         )

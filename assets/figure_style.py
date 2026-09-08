@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+import json
+import logging
 import warnings
 
 import matplotlib as mpl
@@ -19,11 +21,80 @@ from matplotlib.ft2font import FT2Font
 from matplotlib.image import AxesImage, FigureImage
 
 
-COLORS = ("#28688A", "#B76032", "#397E65", "#8064A2")
-FONT_CANDIDATES = (
-    "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Source Han Sans SC",
-    "PingFang SC", "WenQuanYi Micro Hei", "DejaVu Sans",
-)
+# Fixed categorical HEX facts, in original order; journal-inspired, not mandates.
+# Source: https://github.com/nanxstats/ggsci/blob/v5.2.0/R/palettes.R
+PALETTES = {
+    "npg": ("#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F",
+            "#8491B4", "#91D1C2", "#DC0000", "#7E6148", "#B09C85"),
+    "aaas": ("#3B4992", "#EE0000", "#008B45", "#631879", "#008280",
+             "#BB0021", "#5F559B", "#A20056", "#808180", "#1B1919"),
+    "nejm": ("#BC3C29", "#0072B5", "#E18727", "#20854E", "#7876B1",
+             "#6F99AD", "#FFDC91", "#EE4C97"),
+    "lancet": ("#00468B", "#ED0000", "#42B540", "#0099B4", "#925E9F",
+               "#FDAF91", "#AD002A", "#ADB6B6", "#1B1919"),
+}
+# Continuous maps use Matplotlib's published definitions, not categorical LUTs.
+CMAPS = {"sequential": ("viridis", "cividis", "Blues"),
+         "diverging": ("RdBu_r", "BrBG", "PuOr")}
+DEFAULT_PALETTES = {"categorical": "npg", "sequential": "viridis", "diverging": "RdBu_r"}
+FONT_FAMILIES = ("Times New Roman", "SimSun")
+
+
+class _MathGlyphGuard(logging.Handler):
+    """Mathtext logs missing glyphs rather than issuing Python warnings."""
+
+    def emit(self, record):
+        if "dummy symbol" in record.getMessage():
+            raise RuntimeError("Missing mathematical glyph in fixed fonts; no substitute permitted. "
+                               + record.getMessage())
+
+
+def _palette_id(kind, palette, project_root):
+    if kind not in DEFAULT_PALETTES:
+        raise ValueError(f"Unknown palette kind: {kind}")
+    choices = DEFAULT_PALETTES.copy()
+    if project_root is not None:
+        root = Path(project_root).resolve(strict=True)
+        if not root.is_dir() or root == Path(root.anchor):
+            raise ValueError("project_root must be an explicit project directory.")
+        profile = _inside(root, root / ".figure-style.json")
+        if profile.exists():
+            saved = json.loads(profile.read_text(encoding="utf-8-sig"))
+            if (not isinstance(saved, dict) or saved.get("version") != 1
+                    or set(saved) != {"version", "palettes"}
+                    or not isinstance(saved["palettes"], dict)):
+                raise ValueError("Invalid .figure-style.json schema; do not silently reset it.")
+            for key, value in saved["palettes"].items():
+                available = PALETTES if key == "categorical" else CMAPS.get(key, ())
+                if not isinstance(value, str) or value not in available:
+                    raise ValueError(f"Invalid saved palette: {key}={value!r}")
+                choices[key] = value
+    selected = choices[kind] if palette is None else palette
+    available = PALETTES if kind == "categorical" else CMAPS[kind]
+    if not isinstance(selected, str) or selected not in available:
+        raise ValueError(f"Invalid {kind} palette: {selected!r}")
+    return selected
+
+
+def palette_colors(palette=None, *, project_root=None, count=None):
+    """Read project defaults or trial an ID. Never writes a project profile.
+
+    count prevents accidental cycling when the known series count is too large.
+    Callers keep their semantic series-to-index mapping stable across figures.
+    """
+    colors = PALETTES[_palette_id("categorical", palette, project_root)]
+    if count is None:
+        return colors
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= len(colors):
+        raise ValueError("Series count exceeds this palette or is invalid; do not silently recycle colors.")
+    return colors[:count]
+
+
+def palette_cmap(kind, palette=None, *, project_root=None):
+    """Return a continuous colormap; normalization stays under caller control."""
+    if kind not in CMAPS:
+        raise ValueError("Use sequential or diverging for a continuous color scale.")
+    return mpl.colormaps[_palette_id(kind, palette, project_root)].copy()
 
 
 @dataclass(frozen=True)
@@ -34,60 +105,74 @@ class ExportResult:
     warnings: tuple[str, ...]
 
 
-def _font(required_text: str, family: str | None):
+def _fonts(required_text: str):
     required = {ord(char) for char in required_text if not char.isspace()}
-    candidates = (family,) if family else FONT_CANDIDATES
-    if not family and all(code < 256 for code in required):
-        candidates = ("DejaVu Sans",) + FONT_CANDIDATES[:-1]
-    for candidate in candidates:
+    covered = set()
+    for family in FONT_FAMILIES:
         try:
             path = font_manager.findfont(
-                font_manager.FontProperties(family=[candidate]), fallback_to_default=False
+                font_manager.FontProperties(family=[family]), fallback_to_default=False
             )
-            glyphs = FT2Font(path).get_charmap()
-        except (ValueError, OSError, RuntimeError):
-            continue
-        if required.issubset(glyphs):
-            return candidate, 0x2212 in glyphs
-    raise RuntimeError(
-        "No available font covers required_text. Choose an installed font that "
-        "covers the actual labels; do not export missing glyphs."
-    )
+            covered.update(FT2Font(path).get_charmap())
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise RuntimeError(f"Required font unavailable: {family}; no substitute permitted.") from exc
+    if not required.issubset(covered):
+        raise RuntimeError("Required fonts do not cover required_text; report unsupported glyphs.")
+    return 0x2212 in covered
 
 
 @contextmanager
-def paper_style(*, required_text: str = "", font_family: str | None = None,
+def paper_style(*, required_text: str = "", project_root=None, palette=None,
                 overrides: dict | None = None):
-    """Use local defaults and yield the chosen font family.
+    """Use fixed bilingual fonts and a project/default or explicit trial palette.
 
     required_text should include actual ordinary labels (not TeX source).
-    Explicitly requested unavailable fonts fail rather than silently falling back.
-    Overrides are local; missing glyphs are checked again during export.
+    Both required fonts must be installed. Overrides may tune size/weight/layout,
+    not replace fonts or bypass palette selection. Yield the fixed family tuple.
+    This context never persists palette choices; human confirmation is separate.
     """
-    chosen, unicode_minus = _font(required_text, font_family)
+    unicode_minus = _fonts(required_text)
     params = {
-        "font.family": "sans-serif", "font.sans-serif": [chosen],
-        "font.size": 10, "axes.labelsize": 10, "axes.titlesize": 11,
-        "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.fontsize": 9,
+        "font.family": list(FONT_FAMILIES),
+        "font.size": 12, "font.weight": "bold", "axes.labelsize": 13,
+        "axes.labelweight": "bold",
+        "xtick.labelsize": 11, "ytick.labelsize": 11, "legend.fontsize": 11,
         "axes.unicode_minus": unicode_minus,
-        "axes.prop_cycle": mpl.cycler(color=COLORS),
+        "axes.prop_cycle": mpl.cycler(color=palette_colors(palette, project_root=project_root)),
+        "image.cmap": _palette_id("sequential", None, project_root),
+        "mathtext.fontset": "custom", "mathtext.rm": "Times New Roman",
+        "mathtext.it": "Times New Roman:italic", "mathtext.bf": "Times New Roman:bold",
+        "mathtext.bfit": "Times New Roman:italic:bold", "mathtext.cal": "Times New Roman",
+        "mathtext.sf": "Times New Roman", "mathtext.tt": "Times New Roman",
+        "mathtext.fallback": None, "text.usetex": False,
         "figure.figsize": (6.4, 4.0), "figure.dpi": 100,
         "figure.facecolor": "white", "axes.facecolor": "white",
         "savefig.facecolor": "white", "savefig.transparent": False,
         "axes.spines.top": False, "axes.spines.right": False,
-        "axes.linewidth": 0.8, "axes.grid": False,
-        "lines.linewidth": 1.6, "lines.markersize": 4.5,
+        "axes.linewidth": 1.2, "axes.grid": False,
+        "lines.linewidth": 1.8, "lines.markersize": 5,
+        "xtick.major.width": 1.1, "ytick.major.width": 1.1,
         "xtick.direction": "out", "ytick.direction": "out",
         "legend.frameon": False,
         "figure.autolayout": False, "figure.constrained_layout.use": False,
         "pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "path",
+        "pdf.use14corefonts": False, "ps.useafm": False,
     }
     if overrides:
-        if "backend" in overrides:
-            raise ValueError("Select a backend in the caller, not in style overrides.")
+        fixed = {"backend", "font.family", "font.serif", "font.sans-serif", "font.monospace",
+                 "font.cursive", "font.fantasy", "text.usetex", "axes.prop_cycle", "image.cmap",
+                 "pdf.use14corefonts", "ps.useafm"}
+        if any(key in fixed or key.startswith("mathtext.") for key in overrides):
+            raise ValueError("Overrides cannot replace fixed fonts, palette selection, or backend.")
         params.update(overrides)
-    with mpl.rc_context(params):
-        yield chosen
+    logger = logging.getLogger("matplotlib")
+    guard = _MathGlyphGuard()
+    logger.addHandler(guard)
+    try:
+        with mpl.rc_context(params):
+            yield FONT_FAMILIES
+    finally:
+        logger.removeHandler(guard)
 
 
 def _inside(root: Path, path: Path) -> Path:
@@ -141,6 +226,13 @@ def save_figure(fig, path, *, project_root, preview: bool = True,
     writing may leave partial outputs, which must be reported by the caller.
     This function does not back up sources, rerun code, retry, or certify data.
     """
+    # Do not silently erase titles: fix the source, preserving semantic labels.
+    for container in (fig, *fig.findobj(match=lambda obj: type(obj).__name__ == "SubFigure")):
+        heading = getattr(container, "_suptitle", None)
+        if heading is not None and heading.get_text().strip():
+            raise ValueError("No in-figure titles: remove suptitle in the source; paper captions are external.")
+    if any(ax.get_title(loc=loc).strip() for ax in fig.axes for loc in ("left", "center", "right")):
+        raise ValueError("No in-figure titles: remove axes titles in the source.")
     if layout not in {"tight", "preserve"}:
         raise ValueError("layout must be 'tight' or 'preserve'.")
     if not 0 < preview_dpi < float("inf"):
