@@ -53,6 +53,41 @@ with paper_style(project_root=PROJECT_ROOT, required_text="实际中英标签 Ti
 
 ## 输出与核验
 
+### 基础审美辅助接口（2026-09-10 新增）
+
+适用判断与参数起点只维护在 [visual-design.md](visual-design.md)。下列接口均不读数据、不补统计、不自动重绘旧图：
+
+- `role_style(role, base_size=11)` 返回新的 kwargs 字典。文字角色为 `axis_label/tick/legend/annotation`，传给相应 Text 或 set_xlabel 等接口；线角色为 `data_line/reference_line`，网格为 `grid`。tick 角色不是 `tick_params` 参数；legend 角色用于图例文字，不直接展开给 `ax.legend`。数据/基准色由调用方明确指定，不内置另一套色板。
+- `annotation_color(background, canvas_color="#FFFFFF")` 返回对实际平坦底色更易辨的黑/白字；考虑 RGBA 透明度叠加到不透明底色和线性化亮度。不会改背景、数值、norm，不适用于未知背景或交错叠层的自动验收。
+- `add_right_colorbar(ax, mappable, label=..., width_pt=10, gap_pt=14, ticks=None, format=None)` 创建随主轴实际位置变化的右侧竖直色条，宽度和间距用 pt。仅支持单个矩形主轴及其 mappable、无 extend 端帽；重复色条拒绝，不替换原对象。不会缩小主轴或增大画布，须先留好侧边空间。
+- `outside_legend(ax, handles, labels, ncols=1, gap_pt=8, base_size=11)` 创建主图上方左对齐图例，保留显式系列顺序，不删除已有图例。tight_layout 可给它留空间；手动布局则由调用方留顶边。列数由实际标签宽度决定，接口不自动试排多轮。
+- `check_visual_balance(fig, data_axes=(), colorbars=(), outside_legends=(), min_main_size_pt=(144,108), alignment_tolerance_pt=2)` 在 draw 后只读检查。主图区小于示例阈值、色条上下偏差、主网格偏重或指定外置图例碰主图/色条、贴画布边缘会返回提示；不判定主观美感，不处理所有文字碰撞。特殊小分面或短色条可说明理由保留。
+- `save_figure` 接收 `outside_legends=(legend,)` 并自动汇总上述默认提示。只传真正应在图外的图例；合法图内图例不要列入该参数。geometry 提示与 prepare notes 都必须处理或解释。
+
+关联色条的调用顺序示例（尺寸/rect 为示例，不是统一版式）：
+
+```python
+with paper_style(project_root=ROOT):
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    cmap = palette_cmap("sequential", project_root=ROOT, purpose="magnitude")
+    mesh = ax.pcolormesh(x, y, saved_values, cmap=cmap, norm=existing_norm)
+    ax.set_xlabel(x_label, **role_style("axis_label"))
+    ax.set_ylabel(y_label, **role_style("axis_label"))
+    notes = prepare_figure(fig, data_axes=(ax,), horizontal_ylabels=(ax,))
+    # 给右侧色条及其文字留区域；主轴先完成 tight_layout，再加外置色条。
+    fig.tight_layout(rect=(0, 0, 0.76, 1))
+    cb = add_right_colorbar(ax, mesh, label=colorbar_label)
+    notes += prepare_figure(fig, data_axes=(ax,), colorbars=(cb,))
+    result = save_figure(fig, target, project_root=ROOT, layout="preserve",
+                         data_axes=(ax,), colorbars=(cb,))
+```
+
+源码须读取并解释 notes/result.warnings，不只接入函数名。有图例时在主轴 tight_layout 前创建 `outside_legend`，准备字体后再排版，导出传 `outside_legends`。先确认最终主图区足够大；示例右侧预留不足/过多时在一次返工内针对性调整。不要在已有关联色条之后再运行无预留的 tight_layout；仅换色保持已确认布局。
+
+接口依据：[Axes locator](https://matplotlib.org/stable/api/_as_gen/matplotlib.axes.Axes.set_axes_locator.html)、[Legend placement](https://matplotlib.org/stable/api/_as_gen/matplotlib.axes.Axes.legend.html)。规则中的审美起点是本项目约定，不是 Matplotlib 官方审美标准。
+
+### 导出保真
+
 沿用目标已有目录和命名；没有约定时用 `<PROJECT_ROOT>/figures/`。正式输出默认 PDF，按要求使用 SVG；检查预览由同一个 Figure 导出 PNG，不做像素修图。模板默认不光栅化矢量 artist；若原图含栅格图层则提示，不能把 PDF/SVG 扩展名当作全矢量证明。
 
 新图可直接用矢量对象表达时保留矢量，例如小矩阵用 `pcolormesh`；Matplotlib 的色条可能自动光栅化，在输出规模合理时可对 `colorbar.solids` 设置 `set_rasterized(False)`。不为了全矢量盲目展开巨大矩阵，也不以此改动矩阵值。

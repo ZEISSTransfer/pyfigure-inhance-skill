@@ -12,6 +12,7 @@ from io import BytesIO
 from pathlib import Path
 import json
 import logging
+import math
 import warnings
 
 import matplotlib as mpl
@@ -21,6 +22,7 @@ from matplotlib.ft2font import FT2Font
 from matplotlib.image import AxesImage, FigureImage
 from matplotlib import patheffects
 from matplotlib.text import Text
+from matplotlib.transforms import Bbox, ScaledTranslation
 
 
 # Fixed categorical HEX facts, in original order; journal-inspired, not mandates.
@@ -51,10 +53,12 @@ class _MathGlyphGuard(logging.Handler):
                                + record.getMessage())
 
 
-def _palette_id(kind, palette, project_root):
+def _palette_id(kind, palette, project_root, *, fallback=None):
     if kind not in DEFAULT_PALETTES:
         raise ValueError(f"Unknown palette kind: {kind}")
     choices = DEFAULT_PALETTES.copy()
+    if fallback is not None:
+        choices[kind] = fallback
     if project_root is not None:
         root = Path(project_root).resolve(strict=True)
         if not root.is_dir() or root == Path(root.anchor):
@@ -92,11 +96,125 @@ def palette_colors(palette=None, *, project_root=None, count=None):
     return colors[:count]
 
 
-def palette_cmap(kind, palette=None, *, project_root=None):
-    """Return a continuous colormap; normalization stays under caller control."""
+def palette_cmap(kind, palette=None, *, project_root=None, purpose=None):
+    """Return a cmap without changing normalization or saved choices.
+
+    purpose='magnitude' offers a light-low/dark-high sequential starting point
+    ONLY when neither a saved sequential choice nor an explicit ID exists.
+    """
     if kind not in CMAPS:
         raise ValueError("Use sequential or diverging for a continuous color scale.")
-    return mpl.colormaps[_palette_id(kind, palette, project_root)].copy()
+    if purpose not in (None, "magnitude") or (purpose is not None and kind != "sequential"):
+        raise ValueError("purpose='magnitude' is only for nonnegative sequential quantities.")
+    fallback = "Blues" if purpose == "magnitude" else None
+    return mpl.colormaps[_palette_id(kind, palette, project_root, fallback=fallback)].copy()
+
+
+def role_style(role, *, base_size=11):
+    """Fresh kwargs for a visual role; not a global override or data transform.
+
+    All text remains bold. Data/reference colors are deliberately omitted:
+    callers must preserve project semantic mappings, not auto-pick a new color.
+    """
+    if not math.isfinite(base_size) or base_size < 8:
+        raise ValueError("Use a finite base_size >= 8 pt; do not shrink text to hide crowding.")
+    text = {"fontweight": "bold", "fontfamily": list(FONT_FAMILIES)}
+    roles = {
+        "axis_label": dict(text, fontsize=base_size + 2),
+        "tick": dict(text, fontsize=base_size),
+        "legend": dict(text, fontsize=base_size),
+        "annotation": dict(text, fontsize=max(8, base_size - 1)),
+        "data_line": {"linewidth": 1.8, "markersize": 4.5},
+        "reference_line": {"linewidth": 1.1},
+        "grid": {"color": "#DCE2E8", "linewidth": 0.45, "linestyle": "solid"},
+    }
+    if role not in roles:
+        raise ValueError(f"Unknown visual role: {role!r}")
+    return roles[role]
+
+
+def annotation_color(background, *, canvas_color="#FFFFFF"):
+    """Choose opaque black/white text for one known flat sRGB background.
+
+    Composite background alpha onto the opaque canvas, then compare linearized
+    relative luminance contrast. Pass cmap(norm(value)), NOT the raw value.
+    This does not inspect pixels or certify visibility over gradients/overlays.
+    """
+    red, green, blue, alpha = mpl.colors.to_rgba(background)
+    canvas = mpl.colors.to_rgba(canvas_color)
+    if canvas[3] != 1:
+        raise ValueError("The compositing canvas must be opaque.")
+    rgb = [alpha * channel + (1 - alpha) * back
+           for channel, back in zip((red, green, blue), canvas[:3])]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    luminance = sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+    return "#000000" if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) else "#FFFFFF"
+
+
+def add_right_colorbar(ax, mappable, *, label, width_pt=10, gap_pt=14,
+                       ticks=None, format=None):
+    """Add a rectangular right bar that follows this axes' active position.
+
+    Reserve right-hand space BEFORE calling. Does not shrink the host, change
+    figure size, infer norm, or replace an existing bar. Use layout='preserve'
+    after explicit margin allocation; shared bars/extend caps need native code.
+    """
+    fig = ax.figure
+    if ax not in fig.axes or ax.name != "rectilinear":
+        raise ValueError("Use a top-level rectangular data axes.")
+    if getattr(mappable, "axes", None) is not ax:
+        raise ValueError("The mappable must belong to the supplied axes.")
+    if getattr(mappable, "colorbar", None) is not None:
+        raise ValueError("An existing colorbar must be handled explicitly, not duplicated.")
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError("Supply a meaningful colorbar label.")
+    if not math.isfinite(width_pt) or width_pt <= 0 or not math.isfinite(gap_pt) or gap_pt < 6:
+        raise ValueError("Use positive width and a gap of at least 6 pt.")
+    if getattr(mappable, "extend", "neither") != "neither":
+        raise ValueError("Extended colorbars require an explicit native layout.")
+
+    def locate(bar_ax, renderer):
+        box = ax.get_position()  # active box honors data aspect constraints
+        figure_width = fig.get_figwidth() * 72
+        return Bbox.from_bounds(box.x1 + gap_pt / figure_width, box.y0,
+                                width_pt / figure_width, box.height)
+
+    cax = fig.add_axes([0, 0, .01, .01], axes_locator=locate)
+    try:
+        cb = fig.colorbar(mappable, cax=cax, orientation="vertical", ticks=ticks, format=format)
+        cb.set_label(label, rotation=0, labelpad=12, ha="left", va="center")
+        cb.ax.yaxis.set_label_position("right")
+        cb.ax.yaxis.set_ticks_position("right")
+    except Exception:
+        fig.delaxes(cax)
+        raise
+    return cb
+
+
+def outside_legend(ax, handles, labels, *, ncols=1, gap_pt=8, base_size=11):
+    """Create an above-plot, left-aligned legend anchored in physical points.
+
+    Explicit handles/labels prevent missing/reordered series. Never replace an
+    existing legend, resize the figure, or decide the number of columns for you.
+    Call before tight_layout, or reserve top space in a fixed layout.
+    """
+    handles, labels = tuple(handles), tuple(labels)
+    if not handles or len(handles) != len(labels):
+        raise ValueError("Supply one label per handle; no implicit truncation.")
+    if isinstance(ncols, bool) or not isinstance(ncols, int) or not 1 <= ncols <= len(handles):
+        raise ValueError("Invalid legend column count.")
+    if not math.isfinite(gap_pt) or gap_pt < 6:
+        raise ValueError("Use a legend gap of at least 6 pt.")
+    if ax not in ax.figure.axes or ax.get_legend() is not None:
+        raise ValueError("Use a top-level axes without an existing legend.")
+    typography = role_style("legend", base_size=base_size)
+    transform = ax.transAxes + ScaledTranslation(0, gap_pt / 72, ax.figure.dpi_scale_trans)
+    return ax.legend(handles, labels, loc="lower left", bbox_to_anchor=(0, 1),
+                     bbox_transform=transform, borderaxespad=0, borderpad=0,
+                     frameon=False, ncols=ncols, handlelength=2, handletextpad=.6,
+                     columnspacing=1.2, labelspacing=.4,
+                     prop={"family": typography["fontfamily"], "weight": "bold",
+                           "size": typography["fontsize"]})
 
 
 @dataclass(frozen=True)
@@ -374,10 +492,64 @@ def _paths(path, project_root, preview, extra_formats):
     return root, tuple(_inside(root, requested.with_suffix('.' + fmt)) for fmt in formats)
 
 
+def check_visual_balance(fig, *, data_axes=(), colorbars=(), outside_legends=(),
+                         min_main_size_pt=(144, 108), alignment_tolerance_pt=2):
+    """Read-only geometry diagnostics after canvas.draw(), not an aesthetic score.
+
+    Size thresholds are review triggers at exported physical size, not universal
+    minima for every panel. Only explicitly supplied outside legends are checked.
+    Does not judge emphasis, color harmony, empty-data regions, or all collisions.
+    """
+    data_axes, colorbars, outside_legends = map(tuple, (data_axes, colorbars, outside_legends))
+    _check_members(fig, data_axes, colorbars)
+    if any(legend.get_figure() is not fig for legend in outside_legends):
+        raise ValueError("Legends must belong to the supplied Figure.")
+    if (len(min_main_size_pt) != 2 or any(not math.isfinite(v) or v <= 0 for v in min_main_size_pt)
+            or not math.isfinite(alignment_tolerance_pt) or alignment_tolerance_pt < 0):
+        raise ValueError("Invalid visual-check thresholds.")
+    renderer = fig.canvas.get_renderer()
+    unit = renderer.points_to_pixels(1)
+    messages = []
+    boxes = [(ax, ax.get_window_extent(renderer)) for ax in data_axes if ax.get_visible() and ax.axison]
+    for index, (ax, box) in enumerate(boxes, 1):
+        if box.width / unit < min_main_size_pt[0] or box.height / unit < min_main_size_pt[1]:
+            messages.append(f"Visual review: main panel {index} is only {box.width / unit:.1f} x "
+                            f"{box.height / unit:.1f} pt; check final-size legibility, not automatic failure.")
+        if any(line.get_visible() and line.get_linewidth() > .8
+               for line in (*ax.get_xgridlines(), *ax.get_ygridlines())):
+            messages.append(f"Visual review: panel {index} major grid is heavy (>0.8 pt); inspect hierarchy.")
+    for cb in colorbars:
+        host = getattr(cb.mappable, "axes", None)
+        if host not in data_axes:
+            continue  # shared/standalone mappings require explicit manual review
+        bar = cb.ax.get_window_extent(renderer)
+        main = host.get_window_extent(renderer)
+        if max(abs(bar.y0 - main.y0), abs(bar.y1 - main.y1)) / unit > alignment_tolerance_pt:
+            messages.append("Visual review: colorbar ends do not align with its main plot; "
+                            "confirm intentional shortened/extended layout or repair.")
+    for legend in outside_legends:
+        if not legend.get_visible():
+            continue
+        box = legend.get_window_extent(renderer)
+        if min(box.x0 - fig.bbox.x0, box.y0 - fig.bbox.y0,
+               fig.bbox.x1 - box.x1, fig.bbox.y1 - box.y1) / unit < 6:
+            messages.append("Visual review: outside legend lacks 6 pt canvas clearance.")
+        for ax, main in boxes:
+            if box.overlaps(main):
+                messages.append("Visual review: outside legend overlaps a selected main plot.")
+            elif min(box.x1, main.x1) > max(box.x0, main.x0) and box.y0 >= main.y1:
+                if (box.y0 - main.y1) / unit < 6:
+                    messages.append("Visual review: outside legend is too close above a main plot (<6 pt).")
+        for cb in colorbars:
+            if box.overlaps(cb.ax.get_tightbbox(renderer)):
+                messages.append("Visual review: outside legend overlaps colorbar content.")
+    return tuple(dict.fromkeys(messages))
+
+
 def save_figure(fig, path, *, project_root, preview: bool = True,
                 preview_dpi: float = 160, extra_formats=(),
                 layout: str = "tight", overwrite: bool = False,
-                data_axes=(), colorbars=()) -> ExportResult:
+                data_axes=(), colorbars=(), outside_legends=()) -> ExportResult:
     """Export the same Figure to PDF/SVG and, by default, a PNG preview.
 
     Relative paths are relative to the caller-supplied project_root.
@@ -386,8 +558,10 @@ def save_figure(fig, path, *, project_root, preview: bool = True,
     writing may leave partial outputs, which must be reported by the caller.
     This function does not back up sources, rerun code, retry, or certify data.
     """
-    data_axes, colorbars = tuple(data_axes), tuple(colorbars)
+    data_axes, colorbars, outside_legends = map(tuple, (data_axes, colorbars, outside_legends))
     _check_members(fig, data_axes, colorbars)
+    if any(legend.get_figure() is not fig for legend in outside_legends):
+        raise ValueError("Legends must belong to the supplied Figure.")
     # Do not silently erase titles: fix the source, preserving semantic labels.
     for container in (fig, *fig.findobj(match=lambda obj: type(obj).__name__ == "SubFigure")):
         heading = getattr(container, "_suptitle", None)
@@ -418,6 +592,8 @@ def save_figure(fig, path, *, project_root, preview: bool = True,
                 fig.tight_layout()
             canvas.draw()
             messages.extend(check_label_spacing(fig, data_axes=data_axes, colorbars=colorbars))
+            messages.extend(check_visual_balance(fig, data_axes=data_axes, colorbars=colorbars,
+                                                 outside_legends=outside_legends))
             bbox = fig.get_tightbbox(canvas.get_renderer())
             width, height = fig.get_size_inches()
             tolerance = 1 / 72  # one point; coarse bounds, not overlap detection

@@ -22,6 +22,8 @@ HEX 编号以模板列表从 1 起计，例如 `npg:1 = #E64B35`、`npg:2 = #4DB
 | 顺序 | `viridis`、`cividis`、`Blues` | `viridis` | 数值有序编码；缺失值、范围和归一化语义 |
 | 发散 | `RdBu_r`、`BrBG`、`PuOr` | `RdBu_r` | 既定的有意义中点、两端方向、范围及归一化 |
 
+2026-09-10 新增情境起点：非负频率/强度首次选色用 `palette_cmap("sequential", purpose="magnitude", project_root=ROOT)`，仅在没有明确候选且项目未确认顺序色时选 Blues。优先级为本次明确候选 > 已确认项目选择 > 情境起点 > 通用起点；不改色板 ID、现有配置或旧图。其他审美与强调色判断见 [visual-design.md](visual-design.md)，不是将 viridis 判为错误。
+
 这里使用 [Matplotlib 官方色图定义与分类](https://matplotlib.org/stable/users/explain/colors/colormaps.html)，不冒称期刊专属方案。连续色图通过名称取得完整色表，不以几个离散 HEX 拼出假梯度。项目沿用同一 Matplotlib 环境并记录版本；需要反向或自定义时明确记录为变体，不覆盖这些 ID。仅换色不得顺便调 `vmin`、`vmax`、`norm`、中点、透明度、缺失值处理或色标刻度。类别色不能直接拿来表示连续数值强弱。
 
 ## 项目选择及持久化
