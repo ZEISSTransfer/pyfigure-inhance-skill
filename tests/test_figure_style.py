@@ -20,6 +20,20 @@ import figure_style as style
 
 
 class FigureStyleTests(unittest.TestCase):
+    def test_bold_and_black_axes_cannot_be_weakened(self):
+        for overrides in ({"font.weight": "normal"}, {"axes.labelweight": "normal"},
+                          {"axes.edgecolor": "gray"}, {"xtick.color": "#777777"},
+                          {"axes.linewidth": 0.5}, {"ytick.major.width": 0.5}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                with style.paper_style(overrides=overrides):
+                    pass
+        with style.paper_style():
+            fig, ax = plt.subplots()
+            self.assertEqual(ax.spines["left"].get_edgecolor(), (0, 0, 0, 1))
+            self.assertGreaterEqual(ax.spines["left"].get_linewidth(), 1)
+            self.assertEqual(ax.xaxis.label.get_fontweight(), "bold")
+            plt.close(fig)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pyfigure-test-")
         self.root = Path(self.temp.name) / "project"

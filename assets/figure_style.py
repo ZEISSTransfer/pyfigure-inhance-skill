@@ -19,6 +19,8 @@ from matplotlib import font_manager
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.ft2font import FT2Font
 from matplotlib.image import AxesImage, FigureImage
+from matplotlib import patheffects
+from matplotlib.text import Text
 
 
 # Fixed categorical HEX facts, in original order; journal-inspired, not mandates.
@@ -150,6 +152,8 @@ def paper_style(*, required_text: str = "", project_root=None, palette=None,
         "savefig.facecolor": "white", "savefig.transparent": False,
         "axes.spines.top": False, "axes.spines.right": False,
         "axes.linewidth": 1.2, "axes.grid": False,
+        "axes.edgecolor": "#000000", "axes.labelcolor": "#000000",
+        "xtick.color": "#000000", "ytick.color": "#000000",
         "lines.linewidth": 1.8, "lines.markersize": 5,
         "xtick.major.width": 1.1, "ytick.major.width": 1.1,
         "xtick.direction": "out", "ytick.direction": "out",
@@ -159,6 +163,15 @@ def paper_style(*, required_text: str = "", project_root=None, palette=None,
         "pdf.use14corefonts": False, "ps.useafm": False,
     }
     if overrides:
+        for key in ("font.weight", "axes.labelweight"):
+            if key in overrides and overrides[key] != "bold":
+                raise ValueError("Bold text is required; do not weaken font weight.")
+        for key in ("axes.linewidth", "xtick.major.width", "ytick.major.width"):
+            if key in overrides and not float(overrides[key]) >= 1.0:
+                raise ValueError("Visible axes and major ticks must be at least 1.0 pt.")
+        for key in ("axes.edgecolor", "xtick.color", "ytick.color"):
+            if key in overrides and mpl.colors.to_hex(overrides[key]) != "#000000":
+                raise ValueError("Axes and ticks must be black.")
         fixed = {"backend", "font.family", "font.serif", "font.sans-serif", "font.monospace",
                  "font.cursive", "font.fantasy", "text.usetex", "axes.prop_cycle", "image.cmap",
                  "pdf.use14corefonts", "ps.useafm"}
@@ -189,6 +202,152 @@ def _inside(root: Path, path: Path) -> Path:
     return resolved
 
 
+class _CJKStroke(patheffects.withStroke):
+    """Same-color typographic thickening; distinguish it for idempotent updates."""
+
+    def __init__(self, width, color):
+        self.stroke_width = width
+        super().__init__(linewidth=width, foreground=color)
+
+
+def _has_cjk(text):
+    return any('\u3400' <= ch <= '\u9fff' or '\uf900' <= ch <= '\ufaff'
+               or '\U00020000' <= ch <= '\U0003134f' for ch in text)
+
+
+def _check_members(fig, data_axes, colorbars, horizontal_ylabels=()):
+    if any(ax not in fig.axes for ax in (*data_axes, *horizontal_ylabels)):
+        raise ValueError("Axes must belong to the supplied Figure.")
+    if any(cb.ax not in fig.axes or cb.orientation != "vertical" for cb in colorbars):
+        raise ValueError("Only vertical colorbars belonging to this Figure are supported.")
+    if any(cb.ax in data_axes for cb in colorbars):
+        raise ValueError("Keep data_axes and colorbar axes separate.")
+    if any(ax not in data_axes for ax in horizontal_ylabels):
+        raise ValueError("Horizontal y labels must belong to the selected data_axes.")
+
+
+def prepare_figure(fig, *, data_axes=(), colorbars=(), horizontal_ylabels=(),
+                   labelpad=12, cjk_stroke=0.25):
+    """Explicitly apply fixed typography/axes and selected horizontal labels.
+
+    Never changes data, colormaps, normalization, axes limits, grid lines or the
+    canvas layout. Call after creating labels/legends/colorbars, before export.
+    Existing non-template path effects are retained and reported for review.
+    Returns diagnostics, not visual approval. This is NOT called by save_figure.
+    """
+    data_axes, colorbars, horizontal_ylabels = map(tuple, (data_axes, colorbars, horizontal_ylabels))
+    _check_members(fig, data_axes, colorbars, horizontal_ylabels)
+    if not 6 <= labelpad < float("inf") or not 0 < cjk_stroke <= 0.5:
+        raise ValueError("Use labelpad >= 6 pt and a CJK stroke in (0, 0.5] pt.")
+    _fonts("")
+    for ax in data_axes:
+        if not ax.axison:
+            continue  # do not turn schematic/annotation panels into coordinate plots
+        for name, spine in ax.spines.items():
+            if name in ("left", "bottom"):
+                spine.set_visible(True)
+            if spine.get_visible():
+                spine.set_color("#000000")
+                spine.set_linestyle("solid")
+                spine.set_linewidth(max(1.2, spine.get_linewidth()))
+        ax.tick_params(axis="both", which="major", color="black", labelcolor="black",
+                       width=1.1, length=3.5)
+    for ax in horizontal_ylabels:
+        ax.yaxis.set_label_position("left")
+        ax.set_ylabel(ax.get_ylabel(), rotation=0, labelpad=labelpad,
+                      ha="right", va="center", multialignment="right")
+    for cb in colorbars:
+        cb.ax.yaxis.set_ticks_position("right")
+        cb.ax.yaxis.set_label_position("right")
+        cb.set_label(cb.ax.get_ylabel(), rotation=0, labelpad=labelpad,
+                     ha="left", va="center", multialignment="left")
+        cb.ax.tick_params(axis="y", which="major", color="black", labelcolor="black", width=1.1)
+        cb.outline.set_visible(True)
+        cb.outline.set_edgecolor("black")
+        cb.outline.set_linestyle("solid")
+        cb.outline.set_linewidth(1.0)
+    # Materialize current tick labels before styling; this does not render a file.
+    for ax in (*data_axes, *(cb.ax for cb in colorbars)):
+        ax.get_xticklabels()
+        ax.get_yticklabels()
+    messages = []
+    for text in fig.findobj(match=Text):
+        if not text.get_visible() or not text.get_text().strip():
+            continue
+        text.set_fontfamily(list(FONT_FAMILIES))
+        text.set_fontweight("bold")
+        original = [effect for effect in text.get_path_effects() if not isinstance(effect, _CJKStroke)]
+        if _has_cjk(text.get_text()):
+            if original:
+                messages.append(f"Existing text effects retained; inspect CJK weight: {text.get_text()}")
+                text.set_path_effects(original)
+            else:
+                text.set_path_effects([_CJKStroke(cjk_stroke, text.get_color())])
+        else:
+            text.set_path_effects(original)
+    return tuple(dict.fromkeys(messages))
+
+
+def _text_box(text, renderer):
+    width = max((effect.stroke_width for effect in text.get_path_effects()
+                 if isinstance(effect, _CJKStroke)), default=0)
+    return text.get_window_extent(renderer).padded(renderer.points_to_pixels(width / 2))
+
+
+def check_label_spacing(fig, *, data_axes=(), colorbars=(), min_gap_pt=6):
+    """Check right vertical colorbar chains and horizontal y-label clearances.
+
+    Read-only after the caller's canvas draw; works with the current renderer.
+    This targeted geometry check is not a general-purpose overlap detector.
+    """
+    data_axes, colorbars = tuple(data_axes), tuple(colorbars)
+    _check_members(fig, data_axes, colorbars)
+    if not 0 < min_gap_pt < float("inf"):
+        raise ValueError("min_gap_pt must be finite and positive.")
+    renderer = fig.canvas.get_renderer()
+    unit = renderer.points_to_pixels(1)
+    messages = []
+
+    def gap(name, value):
+        value /= unit
+        if value < min_gap_pt:
+            messages.append(f"Label spacing: {name} = {value:.1f} pt; require >= {min_gap_pt:g} pt.")
+
+    def canvas_gap(name, box):
+        gap(name + " / canvas", min(box.x0 - fig.bbox.x0, box.y0 - fig.bbox.y0,
+                                    fig.bbox.x1 - box.x1, fig.bbox.y1 - box.y1))
+
+    for cb in colorbars:
+        bar = cb.ax.get_window_extent(renderer)
+        host = getattr(cb.mappable, "axes", None)
+        hosts = (host,) if host in data_axes else data_axes
+        for ax in hosts:
+            box = ax.get_window_extent(renderer)
+            if min(box.y1, bar.y1) > max(box.y0, bar.y0):
+                gap("main plot / colorbar", bar.x0 - box.x1)
+        label = cb.ax.yaxis.label
+        if not label.get_visible() or not label.get_text().strip():
+            continue
+        if cb.ax.yaxis.get_label_position() != "right" or label.get_rotation() % 360 != 0:
+            messages.append("Label spacing: vertical colorbar name should be horizontal, outside right ticks.")
+        box = _text_box(label, renderer)
+        ticks = [t for t in cb.ax.get_yticklabels() if t.get_visible() and t.get_text().strip()]
+        right_edge = max([bar.x1, *(_text_box(t, renderer).x1 for t in ticks)])
+        gap("colorbar ticks / name", box.x0 - right_edge)
+        canvas_gap("colorbar name", box)
+    for ax in data_axes:
+        label = ax.yaxis.label
+        if (label.get_visible() and label.get_text().strip() and label.get_rotation() % 360 == 0
+                and ax.yaxis.get_label_position() == "left"):
+            box = _text_box(label, renderer)
+            ticks = [t for t in ax.get_yticklabels() if t.get_visible() and t.get_text().strip()]
+            left_edge = min([ax.get_window_extent(renderer).x0,
+                             *(_text_box(t, renderer).x0 for t in ticks)])
+            gap("y label / ticks", left_edge - box.x1)
+            canvas_gap("y label", box)
+    return tuple(dict.fromkeys(messages))
+
+
 def _paths(path, project_root, preview, extra_formats):
     root = Path(project_root).resolve(strict=True)
     if not root.is_dir() or root == Path(root.anchor):
@@ -217,7 +376,8 @@ def _paths(path, project_root, preview, extra_formats):
 
 def save_figure(fig, path, *, project_root, preview: bool = True,
                 preview_dpi: float = 160, extra_formats=(),
-                layout: str = "tight", overwrite: bool = False) -> ExportResult:
+                layout: str = "tight", overwrite: bool = False,
+                data_axes=(), colorbars=()) -> ExportResult:
     """Export the same Figure to PDF/SVG and, by default, a PNG preview.
 
     Relative paths are relative to the caller-supplied project_root.
@@ -226,6 +386,8 @@ def save_figure(fig, path, *, project_root, preview: bool = True,
     writing may leave partial outputs, which must be reported by the caller.
     This function does not back up sources, rerun code, retry, or certify data.
     """
+    data_axes, colorbars = tuple(data_axes), tuple(colorbars)
+    _check_members(fig, data_axes, colorbars)
     # Do not silently erase titles: fix the source, preserving semantic labels.
     for container in (fig, *fig.findobj(match=lambda obj: type(obj).__name__ == "SubFigure")):
         heading = getattr(container, "_suptitle", None)
@@ -255,6 +417,7 @@ def save_figure(fig, path, *, project_root, preview: bool = True,
             if layout == "tight":
                 fig.tight_layout()
             canvas.draw()
+            messages.extend(check_label_spacing(fig, data_axes=data_axes, colorbars=colorbars))
             bbox = fig.get_tightbbox(canvas.get_renderer())
             width, height = fig.get_size_inches()
             tolerance = 1 / 72  # one point; coarse bounds, not overlap detection
